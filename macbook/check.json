@@ -1,0 +1,136 @@
+{
+  "isupport_models": {
+    "MacBook Air 11-13\" 2010-2017": 7,
+    "MacBook Air 13\" 2018-2020": 7,
+    "MacBook Air 13\" M1": 6,
+    "MacBook Air 13\" M2": 6,
+    "MacBook Air 15\" M3": 6,
+    "MacBook Pro 13\" 2012-2015": 7,
+    "MacBook Pro 13\" 2016-2017": 7,
+    "MacBook Pro 13\" 2018-2020": 7,
+    "MacBook Pro 13\" M1": 7,
+    "MacBook Pro 13\" M2": 7,
+    "MacBook Pro 14\" M1": 7,
+    "MacBook Pro 14\" M2": 7,
+    "MacBook Pro 14\" M3": 6,
+    "MacBook Pro 15\" 2012-2015": 7,
+    "MacBook Pro 15\" 2016-2017": 7,
+    "MacBook Pro 15\" 2018-2019": 7,
+    "MacBook Pro 16\" Intel": 7,
+    "MacBook Pro 16\" M1": 7,
+    "MacBook Pro 16\" M2": 7,
+    "MacBook Pro 16\" M3": 7
+  },
+  "isupport_repairs": {
+    "Замена матрицы": 20,
+    "Замена дисплея в сборе": 19,
+    "Замена аккумулятора": 20,
+    "Замена клавиатуры": 20,
+    "Замена трекпада": 20,
+    "Замена динамика": 20,
+    "Замена вентилятора": 17
+  },
+  "isupport_sample": [
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена матрицы",
+      "price": 22800,
+      "quality": "",
+      "competitor": "iSupport"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена дисплея в сборе",
+      "price": 22800,
+      "quality": "",
+      "competitor": "iSupport"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена аккумулятора",
+      "price": 10800,
+      "quality": "",
+      "competitor": "iSupport"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена клавиатуры",
+      "price": 6800,
+      "quality": "",
+      "competitor": "iSupport"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена трекпада",
+      "price": 8800,
+      "quality": "",
+      "competitor": "iSupport"
+    }
+  ],
+  "jabuka_models": {
+    "MacBook Air 11-13\" 2010-2017": 8,
+    "MacBook Air 13\" 2018-2020": 8,
+    "MacBook Air 13\" M1": 8,
+    "MacBook Air 13\" M2": 8,
+    "MacBook Air 13\" M3": 8,
+    "MacBook Air 15\" M2": 8,
+    "MacBook Air 15\" M3": 8,
+    "MacBook Pro 13\" 2012-2015": 8,
+    "MacBook Pro 13\" 2016-2017": 8,
+    "MacBook Pro 13\" 2018-2020": 8,
+    "MacBook Pro 13\" M1": 8,
+    "MacBook Pro 13\" M2": 7,
+    "MacBook Pro 15\" 2012-2015": 7,
+    "MacBook Pro 15\" 2016-2017": 7,
+    "MacBook Pro 15\" 2018-2019": 7,
+    "MacBook Pro 16\" Intel": 7,
+    "MacBook Pro 14\" M1": 6,
+    "MacBook Pro 14\" M2": 6
+  },
+  "jabuka_repairs": {
+    "Замена топкейса": 15,
+    "Замена матрицы": 16,
+    "Замена аккумулятора": 18,
+    "Замена трекпада": 18,
+    "Замена клавиатуры": 36,
+    "Замена динамика": 16,
+    "Замена вентилятора": 16
+  },
+  "jabuka_sample": [
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена топкейса",
+      "price": 20000,
+      "quality": "AASP",
+      "competitor": "jabuka"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена матрицы",
+      "price": 14900,
+      "quality": "",
+      "competitor": "jabuka"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена аккумулятора",
+      "price": 8900,
+      "quality": "",
+      "competitor": "jabuka"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена трекпада",
+      "price": 6900,
+      "quality": "",
+      "competitor": "jabuka"
+    },
+    {
+      "model": "MacBook Air 11-13\" 2010-2017",
+      "repair": "Замена клавиатуры",
+      "price": 6900,
+      "quality": "",
+      "competitor": "jabuka"
+    }
+  ]
+}
