@@ -64,21 +64,6 @@ def normalize_model_macbook_multi(text: str) -> list[str]:
         if ml in t:
             return [model]
 
-    best = None
-    best_len = 0
-    for model, aliases in MODEL_ALIASES_MACBOOK.items():
-        for alias in aliases:
-            if alias in t and len(alias) > best_len:
-                best = model
-                best_len = len(alias)
-    if best:
-        return [best]
-
-    for model in MACBOOK_MODELS:
-        ml = model.lower().replace('"', '').replace("(", "").replace(")", "")
-        if ml in t:
-            return [model]
-
     chips_found = _detect_chips_in_text(t)
     is_intel = _has_intel_year(t) or "intel" in t
 

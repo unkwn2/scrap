@@ -1,12 +1,23 @@
 import re
+import os
 import csv
 import io
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from normalize import normalize_model, normalize_repair, extract_price
 
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=10, pool_maxsize=10)
 SESSION = requests.Session()
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -17,7 +28,8 @@ SESSION.verify = True
 def fetch(url: str, timeout: int = 20) -> BeautifulSoup | None:
     try:
         resp = SESSION.get(url, timeout=timeout)
-        resp.encoding = resp.apparent_encoding or "utf-8"
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
         return BeautifulSoup(resp.text, "lxml")
     except Exception as e:
         print(f"  [ERROR] fetch {url}: {e}")
@@ -68,6 +80,19 @@ def _parse_model_page_tables(page_url: str, model: str) -> list[dict]:
     return results
 
 
+def _parallel_model_fetch(model_pages: dict, parse_fn, max_workers=6, per_page_timeout=30):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(parse_fn, m, u): m for m, u in model_pages.items()}
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result(timeout=per_page_timeout))
+            except Exception:
+                pass
+    return results
+
+
 def parse_cepco(url: str) -> list[dict]:
     soup = fetch(url)
     if not soup:
@@ -75,9 +100,13 @@ def parse_cepco(url: str) -> list[dict]:
     results = []
     sections = soup.find_all("div", class_="order__tab-accordion-item-content")
     for section in sections:
+        if section.parent.name == "article":
+            continue
         header_div = section.find_previous_sibling("div", class_="order__tab-header-row")
         if not header_div:
-            header_div = section.parent.find("div", class_="order__tab-header-row")
+            parent_acc = section.find_parent("div", class_="order__tab-accordion-item")
+            if parent_acc:
+                header_div = parent_acc.find("div", class_="order__tab-header-row")
         section_repair = None
         if header_div:
             header_text = header_div.get_text(strip=True)
@@ -104,18 +133,17 @@ def parse_hardworkers(base_url: str, iphone_url: str) -> list[dict]:
     soup = fetch(iphone_url)
     if not soup:
         return []
-    results = []
     model_pages = _collect_model_links(soup, base_url, "remont-iphone")
     if not model_pages:
         model_pages = _collect_model_links(soup, base_url, "/iphone")
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         price_rows = psoup.find_all("div", class_="prices__table-row")
         if not price_rows:
             price_rows = psoup.find_all("div", class_="prices-damage__table-row")
@@ -131,30 +159,27 @@ def parse_hardworkers(base_url: str, iphone_url: str) -> list[dict]:
                 repair = normalize_repair(name_text)
                 price = extract_price(price_text)
                 if repair and price and price > 100:
-                    results.append({
-                        "model": model,
-                        "repair": repair,
-                        "price": price,
-                    })
+                    local.append({"model": model, "repair": repair, "price": price})
         if not price_rows:
-            results.extend(_parse_model_page_tables(page_url, model))
-    return results
+            local.extend(_parse_model_page_tables(page_url, model))
+        return local
+
+    return _parallel_model_fetch(matching, _parse_one)
 
 
 def parse_applepro(base_url: str, iphone_url: str) -> list[dict]:
     soup = fetch(iphone_url)
     if not soup:
         return []
-    results = []
     model_pages = _collect_model_links(soup, base_url, "remont-iphone/iphone-")
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         rows = psoup.find_all("tr")
         for row in rows:
             cells = row.find_all(["td", "th"])
@@ -164,11 +189,7 @@ def parse_applepro(base_url: str, iphone_url: str) -> list[dict]:
                 repair = normalize_repair(repair_text)
                 price = extract_price(price_text)
                 if repair and price and price > 100:
-                    results.append({
-                        "model": model,
-                        "repair": repair,
-                        "price": price,
-                    })
+                    local.append({"model": model, "repair": repair, "price": price})
         service_divs = psoup.find_all("div", class_="service-item")
         for div in service_divs:
             name_el = div.find("div", class_="service-name") or div.find("a")
@@ -177,12 +198,10 @@ def parse_applepro(base_url: str, iphone_url: str) -> list[dict]:
                 repair = normalize_repair(name_el.get_text(strip=True))
                 price = extract_price(price_el.get_text(strip=True))
                 if repair and price and price > 100:
-                    results.append({
-                        "model": model,
-                        "repair": repair,
-                        "price": price,
-                    })
-    return results
+                    local.append({"model": model, "repair": repair, "price": price})
+        return local
+
+    return _parallel_model_fetch(matching, _parse_one)
 
 
 def parse_modmac(base_url: str) -> list[dict]:
@@ -205,13 +224,13 @@ def parse_modmac(base_url: str) -> list[dict]:
             if model not in model_pages:
                 model_pages[model] = href
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching_pages = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         price_blocks = psoup.find_all("div", class_="services_list_price_block")
         for pb in price_blocks:
             row = pb.parent.parent if pb.parent else None
@@ -230,12 +249,22 @@ def parse_modmac(base_url: str) -> list[dict]:
             repair = normalize_repair(name)
             price = extract_price(price_text)
             if repair and price and price > 100:
-                results.append({
+                local.append({
                     "model": model,
                     "repair": repair,
                     "price": price,
                 })
-        results.extend(_parse_model_page_tables(page_url, model))
+        local.extend(_parse_model_page_tables(page_url, model))
+        return local
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_parse_one, m, u): m for m, u in matching_pages.items()}
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result(timeout=30))
+            except Exception:
+                pass
     return results
 
 
@@ -246,13 +275,13 @@ def parse_dabro(base_url: str) -> list[dict]:
     results = []
     model_pages = _collect_model_links(soup, base_url, "remont-iphone-")
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching_pages = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         tables = psoup.find_all("table")
         for table in tables:
             rows = table.find_all("tr")
@@ -272,11 +301,21 @@ def parse_dabro(base_url: str) -> list[dict]:
                         price_line = cells[1].get_text(strip=True)
                     price = extract_price(price_line)
                     if price and price > 100:
-                        results.append({
+                        local.append({
                             "model": model,
                             "repair": repair,
                             "price": price,
                         })
+        return local
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_parse_one, m, u): m for m, u in matching_pages.items()}
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result(timeout=30))
+            except Exception:
+                pass
     return results
 
 
@@ -284,7 +323,6 @@ def parse_planetiphone(base_url: str) -> list[dict]:
     soup = fetch(base_url)
     if not soup:
         return []
-    results = []
     all_links = [a for a in soup.find_all('a', href=True) if 'remont-iphone-' in a['href'] and '.html' in a['href']]
     model_pages = {}
     for a in all_links:
@@ -297,13 +335,13 @@ def parse_planetiphone(base_url: str) -> list[dict]:
             if model not in model_pages:
                 model_pages[model] = href
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         tables = psoup.find_all("table")
         for table in tables:
             rows = table.find_all("tr")
@@ -322,12 +360,10 @@ def parse_planetiphone(base_url: str) -> list[dict]:
                         continue
                     price = extract_price(price_text)
                     if price and price > 100:
-                        results.append({
-                            "model": model,
-                            "repair": repair,
-                            "price": price,
-                        })
-    return results
+                        local.append({"model": model, "repair": repair, "price": price})
+        return local
+
+    return _parallel_model_fetch(matching, _parse_one)
 
 
 DISPLEYMASTER_URL_PATTERNS = [
@@ -376,13 +412,16 @@ def parse_displeymaster(base_url: str) -> list[dict]:
             pages[key] = (href, repair)
 
     target = _get_target_models()
+    matching = {}
     for (model, repair_type), (page_url, _) in pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.2)
+        if model in target:
+            matching[(model, repair_type)] = (page_url, repair_type)
+
+    def _parse_one(model, repair_type, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         tables = psoup.find_all("table")
         for table in tables:
             rows = table.find_all("tr")
@@ -401,14 +440,22 @@ def parse_displeymaster(base_url: str) -> list[dict]:
                         price = p
                         break
                 if price:
-                    results.append({
-                        "model": model,
-                        "repair": row_repair,
-                        "price": price,
-                    })
+                    local.append({"model": model, "repair": row_repair, "price": price})
+        return local
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {}
+        for (model, repair_type), (page_url, _) in matching.items():
+            futures[pool.submit(_parse_one, model, repair_type, page_url)] = model
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result(timeout=30))
+            except Exception:
+                pass
 
     for extra_url in DISPLEYMASTER_EXTRA_PAGES:
-        time.sleep(0.2)
         esoup = fetch(extra_url)
         if not esoup:
             continue
@@ -498,7 +545,6 @@ def parse_kibercentre(base_url: str) -> list[dict]:
     soup = fetch(base_url)
     if not soup:
         return []
-    results = []
     all_links = [a for a in soup.find_all('a', href=True)
                  if 'remont_iphone_' in a['href'] or 'iphone_' in a['href']]
     model_pages = {}
@@ -518,13 +564,13 @@ def parse_kibercentre(base_url: str) -> list[dict]:
             if model not in model_pages:
                 model_pages[model] = href
     target = _get_target_models()
-    for model, page_url in model_pages.items():
-        if model not in target:
-            continue
-        time.sleep(0.3)
+    matching = {m: u for m, u in model_pages.items() if m in target}
+
+    def _parse_one(model, page_url):
+        local = []
         psoup = fetch(page_url)
         if not psoup:
-            continue
+            return local
         tables = psoup.find_all("table")
         for table in tables:
             rows = table.find_all("tr")
@@ -538,11 +584,7 @@ def parse_kibercentre(base_url: str) -> list[dict]:
                         continue
                     price = extract_price(price_text)
                     if price and price > 100:
-                        results.append({
-                            "model": model,
-                            "repair": repair,
-                            "price": price,
-                        })
+                        local.append({"model": model, "repair": repair, "price": price})
         if not tables:
             price_containers = psoup.find_all("div", class_="iphonebanner__pricecont")
             for pc in price_containers:
@@ -556,12 +598,10 @@ def parse_kibercentre(base_url: str) -> list[dict]:
                 if price_val:
                     price = extract_price(price_val.get_text(strip=True))
                     if repair and price and price > 100:
-                        results.append({
-                            "model": model,
-                            "repair": repair,
-                            "price": price,
-                        })
-    return results
+                        local.append({"model": model, "repair": repair, "price": price})
+        return local
+
+    return _parallel_model_fetch(matching, _parse_one)
 
 
 def parse_google_sheets(url: str) -> list[dict]:
@@ -656,19 +696,28 @@ def parse_jabuka(url: str) -> list[dict]:
         soup = BeautifulSoup(content, "lxml")
         recs = soup.find_all("div", class_="t-rec", attrs={"data-record-type": "396"})
 
-        model_list = [m for m in JABUKA_MODEL_ORDER if m in _get_target_models()]
-
-        price_blocks = []
         for rec in recs:
-            text = rec.get_text(separator=" | ", strip=True)
-            if "замена" in text.lower() and "₽" in text:
-                price_blocks.append(text)
+            rec_text = rec.get_text(separator=" ", strip=True)
+            model = None
+            for m in JABUKA_MODEL_ORDER:
+                if m.lower() in rec_text.lower():
+                    if m in _get_target_models():
+                        model = m
+                        break
+            if not model:
+                headings = rec.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+                for h in headings:
+                    model = normalize_model(h.get_text(strip=True))
+                    if model and model in _get_target_models():
+                        break
+            if not model:
+                continue
 
-        for i, block_text in enumerate(price_blocks):
-            if i >= len(model_list):
-                break
-            model = model_list[i]
-            pairs = re.findall(r'(Замена[^₽]*?)\s*(\d[\d\s]*)₽', block_text)
+            text = rec.get_text(separator=" | ", strip=True)
+            if "замена" not in text.lower() or "₽" not in text:
+                continue
+
+            pairs = re.findall(r'(Замена[^₽]*?)\s*(\d[\d\s]*)₽', text)
             for repair_text, price_text in pairs:
                 repair = normalize_repair(repair_text)
                 price = extract_price(price_text)
@@ -680,208 +729,133 @@ def parse_jabuka(url: str) -> list[dict]:
 
 
 def parse_isupport(index_url: str) -> list[dict]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("  [INFO] playwright not available for isupport")
-        return []
-
-    results = []
-    base = "https://www.isupport.ru"
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            page.goto(index_url.rstrip("/") + "/", timeout=60000)
-            page.wait_for_timeout(4000)
-
-            links = page.query_selector_all("a")
-            model_pages = {}
-            for a in links:
-                href = a.get_attribute("href") or ""
-                text = (a.inner_text() or "").strip()
-                model = normalize_model(text)
-                if model and href and "/repair/repair-iphone/iphone-" in href:
-                    if model not in model_pages:
-                        full = href if href.startswith("http") else base + href
-                        model_pages[model] = full
-
-            target = _get_target_models()
-            for model, page_url in sorted(model_pages.items()):
-                if model not in target:
-                    continue
-                try:
-                    page.goto(page_url, timeout=30000)
-                except Exception:
-                    continue
-                page.wait_for_timeout(3000)
-                try:
-                    for _ in range(8):
-                        page.evaluate("window.scrollBy(0, 600)")
-                        page.wait_for_timeout(200)
-                except Exception:
-                    pass
-                page.wait_for_timeout(1000)
-
-                content = page.content()
-                soup = BeautifulSoup(content, "lxml")
-                items = soup.find_all("div", class_="service-item")
-                for item in items:
-                    try:
-                        title_el = item.find("div", class_="service-item-title")
-                        price_el = item.find("div", class_="service-item-price")
-                        if not title_el or not price_el:
-                            continue
-                        title = title_el.get_text(strip=True)
-                        price_text = price_el.get_text(strip=True)
-                        repair = normalize_repair(title)
-                        price = extract_price(price_text)
-                        if repair and price and price > 100:
-                            results.append({
-                                "model": model,
-                                "repair": repair,
-                                "price": price,
-                            })
-                    except Exception:
-                        pass
-
-            browser.close()
-    except Exception as e:
-        print(f"  [ERROR] isupport playwright: {e}")
-    return results
+    print("  [INFO] isupport: site became online store, repair prices not available")
+    return []
 
 
-MOSDISPLAY_FILE_PATH = r"C:\devin_ai_powershell_devin\competitor_scraper_irepair\ЦЕНЫ Mosdisplay"
-
-
-def _load_mosdisplay_workbook():
-    import os
-    if os.path.exists(MOSDISPLAY_FILE_PATH + ".xlsx"):
-        import openpyxl
-        return openpyxl.load_workbook(MOSDISPLAY_FILE_PATH + ".xlsx", data_only=True)
-    if os.path.exists(MOSDISPLAY_FILE_PATH + ".xls"):
-        try:
-            import openpyxl
-            return openpyxl.load_workbook(MOSDISPLAY_FILE_PATH + ".xls", data_only=True)
-        except Exception:
-            pass
-        try:
-            import xlrd
-            return xlrd.open_workbook(MOSDISPLAY_FILE_PATH + ".xls")
-        except Exception:
-            pass
-    return None
-
-
-def _iter_ws_rows(ws, is_xlrd=False):
-    if is_xlrd:
-        for rx in range(ws.nrows):
-            yield [ws.cell_value(rx, cx) for cx in range(ws.ncols)]
-    else:
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=False):
-            yield [str(c.value or "").strip() for c in row]
+MOSDISPLAY_SPREADSHEET_ID = "1izIB76D-voBID-SxjP06gKT-vr069iAQuR6tH7r3Mn4"
 
 
 def parse_mosdisplay(_) -> list[dict]:
-    try:
-        import openpyxl
-    except ImportError:
-        print("  [INFO] openpyxl not available for mosdisplay")
-        return []
-
     results = []
     try:
-        wb = _load_mosdisplay_workbook()
-        if wb is None:
-            print("  [WARN] mosdisplay: file not found (ЦЕНЫ Mosdisplay.xlsx/.xls)")
-            return []
-        is_xlrd = hasattr(wb, 'sheet_by_index')
-        sheet_names = wb.sheet_names() if is_xlrd else wb.sheetnames
+        import gspread as _gs
+        _gc = _gs.service_account(
+            os.path.join(os.path.dirname(__file__), "credentials", "credentials.json")
+        )
+        _sh = _gc.open_by_key(MOSDISPLAY_SPREADSHEET_ID)
 
-        for si, sheet_name in enumerate(sheet_names):
-            sn_lower = sheet_name.lower().strip()
-            is_iphone = "iphone" in sn_lower or "\U0001f4f1" in sheet_name
-            is_macbook = "macbook" in sn_lower
-            if not is_iphone and not is_macbook:
+        iphone_ws = _sh.worksheet("\U0001f4f1 iPhone")
+        all_vals = iphone_ws.get_all_values()
+
+        series_models = {}
+        current_repair = None
+
+        for rv in all_vals:
+            col0 = (rv[0] or "").strip()
+            col2 = (rv[2] or "").strip() if len(rv) > 2 else ""
+            col8 = (rv[8] or "").strip() if len(rv) > 8 else ""
+            col9 = (rv[9] or "").strip() if len(rv) > 9 else ""
+            col10 = (rv[10] or "").strip() if len(rv) > 10 else ""
+            col11 = (rv[11] or "").strip() if len(rv) > 11 else ""
+
+            if col0 and "iphone" in col0.lower() and ("серия" in col0.lower() or "айфон" in col0.lower()):
+                series_models = {}
+                series_num = re.search(r"(\d+)", col0)
+                series_prefix = series_num.group(1) if series_num else ""
+                for ci in [8, 9, 10, 11]:
+                    cv = (rv[ci] or "").strip() if len(rv) > ci else ""
+                    if not cv:
+                        continue
+                    if cv.lower() == "air" and series_prefix:
+                        cv = series_prefix + " Air"
+                    m = normalize_model(cv)
+                    if m:
+                        series_models[ci] = m
+                current_repair = None
                 continue
-            ws = wb.sheet_by_index(si) if is_xlrd else wb[sheet_name]
 
-            if is_iphone:
-                col_model_map = {}
-                for vals in _iter_ws_rows(ws, is_xlrd):
-                    series_text = str(vals[0]).strip() if vals else ""
-                    if series_text and ("серия" in series_text.lower() or (
-                        "iphone" in series_text.lower() and "ремонт" not in series_text.lower()
-                    )):
-                        col_model_map = {}
-                        for i in range(8, min(len(vals), 18)):
-                            cell_val = str(vals[i]).strip() if i < len(vals) else ""
-                            if cell_val:
-                                m = normalize_model(cell_val)
-                                if m:
-                                    col_model_map[i] = m
-                        continue
-                    repair_text = str(vals[2]).strip() if len(vals) > 2 else ""
-                    if not repair_text:
-                        continue
-                    repair = normalize_repair(repair_text)
-                    if not repair:
-                        continue
-                    for col_idx, model in col_model_map.items():
-                        cell_val = str(vals[col_idx]).strip() if col_idx < len(vals) else ""
-                        if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно"]:
-                            continue
-                        first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
-                        first_price = re.split(r'\s', first_price)[0].strip()
-                        price = extract_price(first_price)
-                        if price and price > 100:
-                            results.append({
-                                "model": model,
-                                "repair": repair,
-                                "price": price,
-                                "device_type": "iphone",
-                            })
+            if not series_models:
+                continue
 
-            elif is_macbook:
-                col_repair_map = {}
-                for vals in _iter_ws_rows(ws, is_xlrd):
-                    series_text = str(vals[0]).strip() if vals else ""
-                    if series_text and ("серия" in series_text.lower() or "pro" in series_text.lower() or "air" in series_text.lower()):
-                        col_repair_map = {}
-                        for i in range(4, min(len(vals), 20)):
-                            cell_val = str(vals[i]).strip() if i < len(vals) else ""
-                            if cell_val:
-                                repair = normalize_repair(cell_val)
-                                if repair:
-                                    col_repair_map[i] = repair
+            if col2 and ("замена" in col2.lower() or "чистка" in col2.lower() or "ремонт" in col2.lower()):
+                repair = normalize_repair(col2)
+                if repair:
+                    current_repair = repair
+                else:
+                    current_repair = None
+            elif not col2:
+                continue
+            elif current_repair is None:
+                continue
+
+            if current_repair is None:
+                continue
+
+            for col_idx, model in series_models.items():
+                cell_val = (rv[col_idx] or "").strip() if col_idx < len(rv) else ""
+                if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно", "Уточнить"]:
+                    continue
+                first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
+                price = extract_price(first_price)
+                if not price:
+                    price = extract_price(cell_val)
+                if price and price > 100:
+                    results.append({
+                        "model": model,
+                        "repair": current_repair,
+                        "price": price,
+                        "device_type": "iphone",
+                    })
+
+        macbook_ws_names = [t for t in [ws.title for ws in _sh.worksheets()] if "macbook" in t.lower()]
+        for ws_name in macbook_ws_names:
+            mb_ws = _sh.worksheet(ws_name)
+            mb_vals = mb_ws.get_all_values()
+
+            col_repair_map = {}
+            for rv in mb_vals:
+                col0 = (rv[0] or "").strip()
+                col3 = (rv[3] or "").strip() if len(rv) > 3 else ""
+
+                if col0 and ("pro" in col0.lower() or "air" in col0.lower()):
+                    col_repair_map = {}
+                    for i in range(4, min(len(rv), 20)):
+                        cell_val = (rv[i] or "").strip()
+                        if cell_val:
+                            repair = normalize_repair(cell_val)
+                            if repair:
+                                col_repair_map[i] = repair
+                    continue
+
+                if not col_repair_map:
+                    continue
+
+                marking = col3
+                model_text = (rv[2] or "").strip() if len(rv) > 2 else ""
+                from normalize import normalize_model_macbook
+                model = normalize_model_macbook(marking) or normalize_model_macbook(model_text)
+                if not model:
+                    continue
+
+                for col_idx, repair in col_repair_map.items():
+                    cell_val = (rv[col_idx] or "").strip() if col_idx < len(rv) else ""
+                    if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно"]:
                         continue
-                    if not col_repair_map:
-                        continue
-                    model_text = str(vals[2]).strip() if len(vals) > 2 else ""
-                    marking = str(vals[3]).strip() if len(vals) > 3 else ""
-                    from normalize import normalize_model_macbook
-                    model = normalize_model_macbook(marking) or normalize_model_macbook(model_text)
-                    if not model:
-                        continue
-                    for col_idx, repair in col_repair_map.items():
-                        cell_val = str(vals[col_idx]).strip() if col_idx < len(vals) else ""
-                        if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно"]:
-                            continue
-                        first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
-                        first_price = re.split(r'\s', first_price)[0].strip()
-                        price = extract_price(first_price)
-                        if price and price > 100:
-                            results.append({
-                                "model": model,
-                                "repair": repair,
-                                "price": price,
-                                "device_type": "macbook",
-                            })
-        if not is_xlrd:
-            wb.close()
+                    first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
+                    price = extract_price(first_price)
+                    if not price:
+                        price = extract_price(cell_val)
+                    if price and price > 100:
+                        results.append({
+                            "model": model,
+                            "repair": repair,
+                            "price": price,
+                            "device_type": "macbook",
+                        })
+
     except Exception as e:
-        print(f"  [ERROR] mosdisplay xlsx: {e}")
+        print(f"  [ERROR] mosdisplay google sheets: {e}")
     return results
 
 
@@ -1167,91 +1141,86 @@ def _parse_with_playwright(url: str) -> list[dict]:
     return results
 
 
-APPLEPIE_SLUG_MAP = {
-    "15": "iPhone 15", "15pro": "iPhone 15 Pro", "15promax": "iPhone 15 Pro Max",
-    "15plus": "iPhone 15 Plus", "14": "iPhone 14", "14pro": "iPhone 14 Pro",
-    "14promax": "iPhone 14 Pro Max", "14plus": "iPhone 14 Plus",
-    "13": "iPhone 13", "13pro": "iPhone 13 Pro", "13promax": "iPhone 13 Pro Max",
-    "13mini": "iPhone 13 mini", "12": "iPhone 12", "12pro": "iPhone 12 Pro",
-    "12promax": "iPhone 12 Pro Max", "12mini": "iPhone 12 mini",
-    "11promax": "iPhone 11 Pro Max", "11pro": "iPhone 11 Pro", "11": "iPhone 11",
-    "XSmax": "iPhone XS Max", "XS": "iPhone XS", "X": "iPhone X", "XR": "iPhone XR",
+APPLEPIE_MODEL_PAGES = {
+    "iPhone 16 Pro Max": "https://pieapple.ru/services/iphone-16-pro-max/",
+    "iPhone 16 Pro": "https://pieapple.ru/services/iphone-16-pro/",
+    "iPhone 16 Plus": "https://pieapple.ru/services/iphone-16-plus/",
+    "iPhone 16": "https://pieapple.ru/services/iphone-16-2/",
+    "iPhone 15 Pro Max": "https://pieapple.ru/services/iphone-15-pro-max/",
+    "iPhone 15 Pro": "https://pieapple.ru/services/iphone-15-pro/",
+    "iPhone 15 Plus": "https://pieapple.ru/services/iphone-15-plus/",
+    "iPhone 15": "https://pieapple.ru/services/iphone-15/",
+    "iPhone 14 Pro Max": "https://pieapple.ru/services/iphone-14-pro-max/",
+    "iPhone 14 Pro": "https://pieapple.ru/services/iphone-14-pro/",
+    "iPhone 14 Plus": "https://pieapple.ru/services/iphone-14-plus/",
+    "iPhone 14": "https://pieapple.ru/services/iphone-14/",
+    "iPhone 13 Pro Max": "https://pieapple.ru/services/iphone-13-pro-max/",
+    "iPhone 13 Pro": "https://pieapple.ru/services/iphone-13-pro/",
+    "iPhone 13 mini": "https://pieapple.ru/services/iphone-13-mini/",
+    "iPhone 13": "https://pieapple.ru/services/iphone-13/",
+    "iPhone 12 Pro Max": "https://pieapple.ru/services/iphone-12-pro-max/",
+    "iPhone 12 Pro": "https://pieapple.ru/services/iphone-12-pro/",
+    "iPhone 12 mini": "https://pieapple.ru/services/iphone-12-mini/",
+    "iPhone 12": "https://pieapple.ru/services/iphone-12/",
+    "iPhone 11 Pro Max": "https://pieapple.ru/services/iphone-11-pro-max/",
+    "iPhone 11 Pro": "https://pieapple.ru/services/iphone-11-pro/",
+    "iPhone 11": "https://pieapple.ru/services/iphone-11/",
+    "iPhone XS Max": "https://pieapple.ru/services/iphone-xs-max/",
+    "iPhone XS": "https://pieapple.ru/services/iphone-xs/",
+    "iPhone XR": "https://pieapple.ru/services/iphone-xr/",
+    "iPhone X": "https://pieapple.ru/services/iphone-x/",
 }
 
 
 def parse_applepie(base_url: str) -> list[dict]:
-    soup = fetch(base_url)
-    if not soup:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [INFO] playwright not available for applepie")
         return []
+
     results = []
-    target = _get_target_models()
+    target = set(_get_target_models())
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-    price_links = [a for a in soup.find_all('a', href=True) if '/price-' in a['href']]
-    model_pages = {}
-    for a in price_links:
-        href = a['href']
-        slug = href.split('/price-')[-1].rstrip('/').split('?')[0].split('#')[0]
-        model = APPLEPIE_SLUG_MAP.get(slug)
-        if not model:
-            link_text = a.get_text(strip=True)
-            model = normalize_model(link_text)
-        if model and model in target:
-            if not href.startswith("http"):
-                href = base_url.rstrip("/") + "/" + href.lstrip("/")
-            if model not in model_pages:
-                model_pages[model] = href
-
-    for model, page_url in model_pages.items():
-        time.sleep(0.3)
-        psoup = fetch(page_url)
-        if not psoup:
-            continue
-
-        slots = psoup.find_all("div", class_="ms-slot--param-slot")
-        for slot in slots:
-            first_blk = slot.find("div", class_="blk_text")
-            if not first_blk:
-                continue
-            service_name = first_blk.get_text(strip=True)
-
-            yellow_boxes = slot.find_all("div", class_="blk_box_self")
-            price_text = None
-            for yb in yellow_boxes:
-                style = yb.get("style", "") or yb.get("bg", "")
-                if "ffd832" not in style.lower() and "#ffd832" not in style.lower():
-                    bg_attr = yb.get("bg", "")
-                    if "ffd832" not in bg_attr.lower():
-                        continue
-                bd = yb.find("div", class_="blk-data")
-                if not bd:
+            for model, page_url in APPLEPIE_MODEL_PAGES.items():
+                if model not in target:
                     continue
-                txt = bd.get_text(strip=True)
-                if "руб" in txt.lower() or re.match(r'^[\d\s]+руб', txt):
-                    price_text = txt
-                    break
+                try:
+                    page.goto(page_url, timeout=20000)
+                    page.wait_for_timeout(4000)
+                    for _ in range(6):
+                        page.evaluate("window.scrollBy(0, 500)")
+                        page.wait_for_timeout(200)
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    continue
 
-            if not price_text:
-                for yb in yellow_boxes:
-                    bd = yb.find("div", class_="blk-data")
-                    if bd:
-                        txt = bd.get_text(strip=True)
-                        p = extract_price(txt)
-                        if p and p > 500 and not any(
-                            kw in txt.lower()
-                            for kw in ["мин", "час", "день", "бесплатно", "уточнять"]
-                        ):
-                            price_text = txt
-                            break
+                content = page.content()
+                soup = BeautifulSoup(content, "lxml")
+                text = soup.get_text(separator="\n", strip=True)
 
-            repair = normalize_repair(service_name)
-            price = extract_price(price_text) if price_text else None
-            if repair and price and price > 100:
-                results.append({
-                    "model": model,
-                    "repair": repair,
-                    "price": price,
-                })
+                pairs = re.findall(
+                    r'(Замена[^\n]*?|Восстановление[^\n]*?|Ремонт[^\n]*?)\n\s*(\d[\d\s]*(?:руб|₽|р\.))',
+                    text,
+                )
+                for repair_text, price_text in pairs:
+                    repair = normalize_repair(repair_text)
+                    price = extract_price(price_text)
+                    quality = ""
+                    if "оригинал" in repair_text.lower() or "orig" in repair_text.lower():
+                        quality = "AASP"
+                    elif "копия" in repair_text.lower() or "аналог" in repair_text.lower():
+                        quality = "OEM"
+                    if repair and price and price > 100:
+                        results.append({"model": model, "repair": repair, "price": price, "quality": quality})
 
+            browser.close()
+    except Exception as e:
+        print(f"  [ERROR] applepie: {e}")
     return results
 
 
@@ -1261,7 +1230,10 @@ def parse_generic(url: str, competitor_name: str) -> list[dict]:
         return []
     results = []
 
-    model_pages = _collect_model_links(soup, url.split("/")[0] + "//" + url.split("/")[2], "remont-iphone")
+    from urllib.parse import urljoin
+    parsed = re.match(r'(https?://[^/]+)', url)
+    base_url = parsed.group(1) if parsed else url
+    model_pages = _collect_model_links(soup, base_url, "remont-iphone")
     target = _get_target_models()
     if model_pages:
         for model, page_url in model_pages.items():

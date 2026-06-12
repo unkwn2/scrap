@@ -3,10 +3,20 @@ import csv
 import io
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from normalize import normalize_model_macbook, normalize_model_macbook_multi, normalize_repair, normalize_quality, extract_price, normalize_with_context_multi
 
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=10, pool_maxsize=10)
 SESSION = requests.Session()
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -16,7 +26,8 @@ SESSION.headers.update({
 def fetch(url: str, timeout: int = 20) -> BeautifulSoup | None:
     try:
         resp = SESSION.get(url, timeout=timeout)
-        resp.encoding = resp.apparent_encoding or "utf-8"
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
         return BeautifulSoup(resp.text, "lxml")
     except Exception as e:
         print(f"  [ERROR] fetch {url}: {e}")
@@ -633,210 +644,126 @@ def parse_modmac(base_url: str, macbook_url: str) -> list[dict]:
     return results
 
 
-MOSDISPLAY_FILE_PATH = r"C:\devin_ai_powershell_devin\competitor_scraper_irepair\ЦЕНЫ Mosdisplay"
-
-
-def _load_mosdisplay_workbook():
-    import os
-    if os.path.exists(MOSDISPLAY_FILE_PATH + ".xlsx"):
-        import openpyxl
-        return openpyxl.load_workbook(MOSDISPLAY_FILE_PATH + ".xlsx", data_only=True)
-    if os.path.exists(MOSDISPLAY_FILE_PATH + ".xls"):
-        try:
-            import openpyxl
-            return openpyxl.load_workbook(MOSDISPLAY_FILE_PATH + ".xls", data_only=True)
-        except Exception:
-            pass
-        try:
-            import xlrd
-            return xlrd.open_workbook(MOSDISPLAY_FILE_PATH + ".xls")
-        except Exception:
-            pass
-    return None
-
-
-def _iter_ws_rows(ws, is_xlrd=False):
-    if is_xlrd:
-        for rx in range(ws.nrows):
-            yield [ws.cell_value(rx, cx) for cx in range(ws.ncols)]
-    else:
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=False):
-            yield [str(c.value or "").strip() for c in row]
+MOSDISPLAY_SPREADSHEET_ID = "1izIB76D-voBID-SxjP06gKT-vr069iAQuR6tH7r3Mn4"
 
 
 def parse_mosdisplay(_) -> list[dict]:
-    try:
-        import openpyxl
-    except ImportError:
-        print("  [INFO] openpyxl not available for mosdisplay")
-        return []
-
     results = []
     try:
-        wb = _load_mosdisplay_workbook()
-        if wb is None:
-            print("  [WARN] mosdisplay: file not found (ЦЕНЫ Mosdisplay.xlsx/.xls)")
-            return []
-        is_xlrd = hasattr(wb, 'sheet_by_index')
-        sheet_names = wb.sheet_names() if is_xlrd else wb.sheetnames
+        import gspread as _gs
+        import os as _os
+        _gc = _gs.service_account(
+            _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "credentials", "credentials.json")
+        )
+        _sh = _gc.open_by_key(MOSDISPLAY_SPREADSHEET_ID)
 
-        for si, sheet_name in enumerate(sheet_names):
-            sn_lower = sheet_name.lower().strip()
-            is_macbook = "macbook" in sn_lower
-            if not is_macbook:
+        _skip_repairs = {"кнопок клавиатуры", "кнопок клавиши", "блока кнопов", "блока кнопок"}
+
+        for ws_name in ["MacBook ", "MacBook"]:
+            try:
+                mb_ws = _sh.worksheet(ws_name)
+            except Exception:
                 continue
-            ws = wb.sheet_by_index(si) if is_xlrd else wb[sheet_name]
+            mb_vals = mb_ws.get_all_values()
 
             col_repair_map = {}
-            for vals in _iter_ws_rows(ws, is_xlrd):
-                series_text = str(vals[0]).strip() if vals else ""
-                if series_text and ("серия" in series_text.lower() or "pro" in series_text.lower() or "air" in series_text.lower()):
+            series = ""
+            diagonal = ""
+            for rv in mb_vals:
+                col0 = (rv[0] or "").strip()
+                col1 = (rv[1] or "").strip() if len(rv) > 1 else ""
+                col2 = (rv[2] or "").strip() if len(rv) > 2 else ""
+                col3 = (rv[3] or "").strip() if len(rv) > 3 else ""
+
+                if col0.lower() in ("pro серия", "air серия", "retina"):
+                    series = col0
                     col_repair_map = {}
-                    for i in range(4, min(len(vals), 20)):
-                        cell_val = str(vals[i]).strip() if i < len(vals) else ""
+                    diagonal = ""
+                    for i in range(4, min(len(rv), 25)):
+                        cell_val = (rv[i] or "").strip()
                         if cell_val:
+                            cell_lower = cell_val.lower()
+                            if any(s in cell_lower for s in _skip_repairs):
+                                continue
                             repair = normalize_repair(cell_val)
                             if repair:
-                                col_repair_map[i] = repair
+                                col_repair_map[i] = {"repair": repair, "raw": cell_val}
                     continue
+
                 if not col_repair_map:
                     continue
-                model_text = str(vals[2]).strip() if len(vals) > 2 else ""
-                marking = str(vals[3]).strip() if len(vals) > 3 else ""
+
+                if col1:
+                    diagonal = col1
+
+                marking = col3
+                model_text = col2
+                if not marking and not model_text:
+                    continue
+
+                if "НЕ БЕРЕМ В РЕМОНТ" in marking.upper():
+                    continue
+
                 model = normalize_model_macbook(marking) or normalize_model_macbook(model_text)
                 if not model:
+                    combined = f"{series} {diagonal} {model_text}".strip()
+                    model = normalize_model_macbook(combined)
+                if not model:
                     continue
-                for col_idx, repair in col_repair_map.items():
-                    cell_val = str(vals[col_idx]).strip() if col_idx < len(vals) else ""
-                    if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно"]:
+
+                for col_idx, col_info in col_repair_map.items():
+                    repair = col_info["repair"]
+                    raw_header = col_info["raw"]
+                    cell_val = (rv[col_idx] or "").strip() if col_idx < len(rv) else ""
+                    if not cell_val or cell_val.lower() in [
+                        "-", "", "уточнять", "нужно уточнить", "недоступно", "утоянять",
+                    ]:
                         continue
+
+                    has_aasp = "AASP" in raw_header or "REF / AASP" in raw_header or "OEM / AASP" in raw_header
+                    parts = [p.strip() for p in cell_val.split("/")]
+                    if len(parts) == 2 and has_aasp:
+                        oem_price = extract_price(parts[0])
+                        aasp_price = extract_price(parts[1])
+                        if oem_price and oem_price > 100:
+                            results.append({
+                                "model": model,
+                                "repair": repair,
+                                "price": oem_price,
+                                "quality": "OEM",
+                                "marking": marking,
+                            })
+                        if aasp_price and aasp_price > 100:
+                            results.append({
+                                "model": model,
+                                "repair": repair,
+                                "price": aasp_price,
+                                "quality": "AASP",
+                                "marking": marking,
+                            })
+                        continue
+
                     first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
-                    first_price = re.split(r'\s', first_price)[0].strip()
                     quality = normalize_quality(model_text) or normalize_quality(cell_val)
                     price = extract_price(first_price)
+                    if not price:
+                        price = extract_price(cell_val)
                     if price and price > 100:
                         results.append({
                             "model": model,
                             "repair": repair,
                             "price": price,
                             "quality": quality,
+                            "marking": marking,
                         })
-        if not is_xlrd:
-            wb.close()
     except Exception as e:
-        print(f"  [ERROR] mosdisplay xlsx: {e}")
+        print(f"  [ERROR] mosdisplay google sheets: {e}")
     return results
 
 
 def parse_isupport(index_url: str) -> list[dict]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("  [INFO] playwright not available for isupport")
-        return []
-
-    results = []
-    base = "https://www.isupport.ru"
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            page.goto(index_url.rstrip("/") + "/", timeout=60000)
-            page.wait_for_timeout(4000)
-
-            category_links = []
-            links = page.query_selector_all("a")
-            for a in links:
-                href = a.get_attribute("href") or ""
-                text = (a.inner_text() or "").strip()
-                if href and "repair-macbook/" in href and href.rstrip("/").split("/")[-1] not in ["macbook", ""]:
-                    if not href.startswith("http"):
-                        href = base + href
-                    category_links.append({"text": text, "href": href})
-
-            if not category_links:
-                for a in links:
-                    href = a.get_attribute("href") or ""
-                    text = (a.inner_text() or "").strip()
-                    if href and "/repair/repair-macbook/" in href:
-                        if not href.startswith("http"):
-                            href = base + href
-                        category_links.append({"text": text, "href": href})
-
-            model_pages = {}
-            for cat in category_links:
-                try:
-                    page.goto(cat["href"], timeout=30000)
-                except Exception:
-                    continue
-                page.wait_for_timeout(3000)
-
-                cat_links = page.query_selector_all("a")
-                for a in cat_links:
-                    href = a.get_attribute("href") or ""
-                    text = (a.inner_text() or "").strip()
-                    if not href:
-                        continue
-                    if not href.startswith("http"):
-                        href = base + href
-                    if "/repair/repair-macbook/" in href and href != cat["href"]:
-                        last_seg = href.rstrip("/").split("/")[-1]
-                        if "macbook" in last_seg.lower() and last_seg not in ["macbook-pro", "macbook-air", "macbook"]:
-                            from normalize import normalize_model_macbook_multi
-                            models = normalize_model_macbook_multi(text)
-                            if models:
-                                for m in models:
-                                    if m not in model_pages:
-                                        model_pages[m] = href
-
-            target = _get_target_models()
-            for model, page_url in sorted(model_pages.items()):
-                if model not in target:
-                    continue
-                try:
-                    page.goto(page_url, timeout=30000)
-                except Exception:
-                    continue
-                page.wait_for_timeout(3000)
-                try:
-                    for _ in range(8):
-                        page.evaluate("window.scrollBy(0, 600)")
-                        page.wait_for_timeout(200)
-                except Exception:
-                    pass
-                page.wait_for_timeout(1000)
-
-                content = page.content()
-                soup = BeautifulSoup(content, "lxml")
-                items = soup.find_all("div", class_="service-item")
-                if not items:
-                    items = soup.find_all("div", class_="service-price-block")
-                for item in items:
-                    try:
-                        title_el = item.find("div", class_="service-item-title")
-                        price_el = item.find("div", class_="service-item-price")
-                        if not title_el or not price_el:
-                            continue
-                        title = title_el.get_text(strip=True)
-                        price_text = price_el.get_text(strip=True)
-                        repair = normalize_repair(title)
-                        quality = normalize_quality(title)
-                        price = extract_price(price_text)
-                        if repair and price and price > 100:
-                            results.append({
-                                "model": model,
-                                "repair": repair,
-                                "price": price,
-                                "quality": quality,
-                            })
-                    except Exception:
-                        pass
-
-            browser.close()
-    except Exception as e:
-        print(f"  [ERROR] isupport playwright: {e}")
-    return results
+    print("  [INFO] isupport: site became online store, repair prices not available")
+    return []
 
 
 JABUKA_MACBOOK_MODEL_ORDER = [
@@ -845,8 +772,10 @@ JABUKA_MACBOOK_MODEL_ORDER = [
     'MacBook Air 13" M1',
     'MacBook Air 13" M2',
     'MacBook Air 13" M3',
+    'MacBook Air 13" M4',
     'MacBook Air 15" M2',
     'MacBook Air 15" M3',
+    'MacBook Air 15" M4',
     'MacBook Pro 13" 2012-2015',
     'MacBook Pro 13" 2016-2017',
     'MacBook Pro 13" 2018-2020',
@@ -888,19 +817,34 @@ def parse_jabuka(url: str) -> list[dict]:
         soup = BeautifulSoup(content, "lxml")
         recs = soup.find_all("div", class_="t-rec", attrs={"data-record-type": "396"})
 
-        model_list = [m for m in JABUKA_MACBOOK_MODEL_ORDER if m in _get_target_models()]
+        target = set(_get_target_models())
 
-        price_blocks = []
         for rec in recs:
-            text = rec.get_text(separator=" | ", strip=True)
-            if "₽" in text and len(text) > 50:
-                price_blocks.append(text)
+            rec_text = rec.get_text(separator=" ", strip=True)
+            model = None
+            for m in JABUKA_MACBOOK_MODEL_ORDER:
+                m_lower = m.lower().replace('"', '')
+                if m_lower in rec_text.lower():
+                    if m in target:
+                        model = m
+                        break
+            if not model:
+                headings = rec.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+                for h in headings:
+                    models = normalize_model_macbook_multi(h.get_text(strip=True))
+                    if models:
+                        for m in models:
+                            if m in target:
+                                model = m
+                                break
+                        if model:
+                            break
+            if not model:
+                continue
 
-        for i, block_text in enumerate(price_blocks):
-            if i >= len(model_list):
-                break
-            model = model_list[i]
-            parts = block_text.split(" | ")
+            parts = rec.get_text(separator=" | ", strip=True).split(" | ")
+            if "₽" not in rec.get_text():
+                continue
             j = 0
             while j + 1 < len(parts):
                 svc = parts[j].strip()
