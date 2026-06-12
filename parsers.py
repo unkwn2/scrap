@@ -759,17 +759,32 @@ def parse_mosdisplay(_) -> list[dict]:
             col10 = (rv[10] or "").strip() if len(rv) > 10 else ""
             col11 = (rv[11] or "").strip() if len(rv) > 11 else ""
 
-            if col0 and "iphone" in col0.lower() and ("серия" in col0.lower() or "айфон" in col0.lower()):
+            is_series_header = False
+            if col0:
+                cl = col0.lower()
+                if ("iphone" in cl and "серия" in cl) or ("айфон" in cl):
+                    is_series_header = True
+                elif re.match(r"^[Xx]\s*[-–]\s*[Xx]", col0):
+                    is_series_header = True
+                elif re.match(r"^\d{1,2}\s*серия", cl):
+                    is_series_header = True
+
+            if is_series_header:
                 series_models = {}
                 series_num = re.search(r"(\d+)", col0)
                 series_prefix = series_num.group(1) if series_num else ""
                 for ci in [8, 9, 10, 11]:
                     cv = (rv[ci] or "").strip() if len(rv) > ci else ""
-                    if not cv:
+                    if not cv or cv.lower() in ("подробнее", "подробн"):
                         continue
+                    test_val = cv
                     if cv.lower() == "air" and series_prefix:
-                        cv = series_prefix + " Air"
-                    m = normalize_model(cv)
+                        test_val = series_prefix + " Air"
+                    m = normalize_model(test_val)
+                    if not m and cv.upper() in ("XSMAX", "XS MAX"):
+                        m = normalize_model("XS Max")
+                    if not m and cv.upper() == "XR":
+                        m = normalize_model("XR")
                     if m:
                         series_models[ci] = m
                 current_repair = None
@@ -786,18 +801,26 @@ def parse_mosdisplay(_) -> list[dict]:
                     current_repair = None
             elif not col2:
                 continue
-            elif current_repair is None:
-                continue
+            else:
+                repair = normalize_repair(col2)
+                if repair:
+                    current_repair = repair
+                else:
+                    current_repair = None
+                    continue
 
             if current_repair is None:
                 continue
 
             for col_idx, model in series_models.items():
                 cell_val = (rv[col_idx] or "").strip() if col_idx < len(rv) else ""
-                if not cell_val or cell_val in ["-", "", "Уточнять", "Нужно уточнить", "Недоступно", "Уточнить"]:
+                if not cell_val or cell_val.lower() in [
+                    "-", "", "уточнять", "нужно уточнить", "недоступно", "уточнить",
+                ]:
                     continue
-                first_price = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0].strip()
-                price = extract_price(first_price)
+                clean = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0]
+                clean = re.split(r"\s+(?=\d)", clean, maxsplit=1)[0].strip()
+                price = extract_price(clean)
                 if not price:
                     price = extract_price(cell_val)
                 if price and price > 100:
@@ -867,43 +890,31 @@ def parse_brobrolab(index_url: str) -> list[dict]:
         return _parse_brobrolab_selenium(index_url)
 
     results = []
+    target = _get_target_models()
+    model_pages = {}
+    for m in target:
+        slug = m.lower().replace(" ", "-")
+        model_pages[m] = f"https://brobrolab.ru/services-{slug}"
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(index_url, timeout=20000)
-            page.wait_for_timeout(3000)
-
-            links = page.query_selector_all("a")
-            model_pages = {}
-            for a in links:
-                href = a.get_attribute("href") or ""
-                text = (a.inner_text() or "").strip().replace("\n", " ")
-                model = normalize_model(text)
-                if model and href and "brobrolab.ru/services-iphone" in href:
-                    if model not in model_pages:
-                        model_pages[model] = href
-
-            target = _get_target_models()
-            count = 0
             for model, page_url in sorted(model_pages.items()):
-                if model not in target:
-                    continue
-                if count >= 20:
-                    break
-                count += 1
                 try:
-                    page.goto(page_url, timeout=20000)
+                    resp = page.goto(page_url, timeout=15000, wait_until="domcontentloaded")
+                    if resp and resp.status == 404:
+                        continue
                 except Exception:
                     continue
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(1500)
                 try:
-                    for _ in range(6):
+                    for _ in range(4):
                         page.evaluate("window.scrollBy(0, 500)")
                         page.wait_for_timeout(200)
                 except Exception:
                     pass
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(500)
 
                 try:
                     cards = page.query_selector_all(".t-store__card")
