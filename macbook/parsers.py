@@ -766,35 +766,47 @@ def parse_isupport(index_url: str) -> list[dict]:
     return []
 
 
-JABUKA_MACBOOK_MODEL_ORDER = [
-    'MacBook Air 11-13" 2010-2017',
-    'MacBook Air 13" 2018-2020',
-    'MacBook Air 13" M1',
-    'MacBook Air 13" M2',
-    'MacBook Air 13" M3',
-    'MacBook Air 13" M4',
-    'MacBook Air 15" M2',
-    'MacBook Air 15" M3',
-    'MacBook Air 15" M4',
-    'MacBook Pro 13" 2012-2015',
-    'MacBook Pro 13" 2016-2017',
-    'MacBook Pro 13" 2018-2020',
-    'MacBook Pro 13" M1',
-    'MacBook Pro 13" M2',
-    'MacBook Pro 15" 2012-2015',
-    'MacBook Pro 15" 2016-2017',
-    'MacBook Pro 15" 2018-2019',
-    'MacBook Pro 16" Intel',
-    'MacBook Pro 14" M1',
-    'MacBook Pro 14" M2',
-    'MacBook Pro 14" M3',
-    'MacBook Pro 14" M4',
-    'MacBook Pro 16" M1',
-    'MacBook Pro 16" M2',
-    'MacBook Pro 16" M3',
-    'MacBook Pro 16" M4',
-    'MacBook 12"',
+JABUKA_MACBOOK_BUTTON_LABELS = [
+    "MacBook Air 11''",
+    "MacBook Air 13''",
+    "MacBook Air Retina 13''",
+    "MacBook Air Retina 15''",
+    "MacBook Pro 13'' (2016-2017)",
+    "MacBook Pro 13'' (2018-2023)",
+    "MacBook Pro 15'' (2016-2017)",
+    "MacBook Pro 15'' (2018-2020)",
+    "MacBook Pro 16'' (2019)",
+    "MacBook Pro 14''",
+    "MacBook Pro 16'' (2021-2025)",
+    "MacBook Pro 13'' Retina",
+    "MacBook Pro 15'' Retina",
+    "MacBook Pro 13'' (2009-2012)",
+    "MacBook Pro 15'' (2009-2012)",
+    "MacBook Pro 17''",
+    "MacBook 12'' (2015)",
+    "MacBook 12'' (2016-2017)",
 ]
+
+JABUKA_MACBOOK_LABEL_TO_MODEL = {
+    "MacBook Air 11''": 'MacBook Air 11-13" 2010-2017',
+    "MacBook Air 13''": 'MacBook Air 11-13" 2010-2017',
+    "MacBook Air Retina 13''": 'MacBook Air 13" M1',
+    "MacBook Air Retina 15''": 'MacBook Air 15" M2',
+    "MacBook Pro 13'' (2016-2017)": 'MacBook Pro 13" 2016-2017',
+    "MacBook Pro 13'' (2018-2023)": 'MacBook Pro 13" M1',
+    "MacBook Pro 15'' (2016-2017)": 'MacBook Pro 15" 2016-2017',
+    "MacBook Pro 15'' (2018-2020)": 'MacBook Pro 15" 2018-2019',
+    "MacBook Pro 16'' (2019)": 'MacBook Pro 16" Intel',
+    "MacBook Pro 14''": 'MacBook Pro 14" M1',
+    "MacBook Pro 16'' (2021-2025)": 'MacBook Pro 16" M1',
+    "MacBook Pro 13'' Retina": 'MacBook Pro 13" 2012-2015',
+    "MacBook Pro 15'' Retina": 'MacBook Pro 15" 2012-2015',
+    "MacBook Pro 13'' (2009-2012)": 'MacBook Pro 13" 2012-2015',
+    "MacBook Pro 15'' (2009-2012)": 'MacBook Pro 15" 2012-2015',
+    "MacBook Pro 17''": 'MacBook Pro 17"',
+    "MacBook 12'' (2015)": 'MacBook 12"',
+    "MacBook 12'' (2016-2017)": 'MacBook 12"',
+}
 
 
 def parse_jabuka(url: str) -> list[dict]:
@@ -805,6 +817,7 @@ def parse_jabuka(url: str) -> list[dict]:
         return []
 
     results = []
+    target = set(_get_target_models())
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -815,48 +828,40 @@ def parse_jabuka(url: str) -> list[dict]:
             browser.close()
 
         soup = BeautifulSoup(content, "lxml")
+
+        selector_rec = soup.find("div", id="rec1643521401")
+        if not selector_rec:
+            all_recs = soup.find_all("div", class_="t-rec")
+            for r in all_recs:
+                if "Выберите модель" in r.get_text(separator=" ", strip=True):
+                    selector_rec = r
+                    break
+        buttons = selector_rec.find_all("div", attrs={"data-elem-type": "button"}) if selector_rec else []
+        button_labels = [b.get_text(strip=True).replace("\u2019", "'").replace("\u2018", "'").replace("\u201c", '"').replace("\u201d", '"') for b in buttons if b.get_text(strip=True)]
+
         recs = soup.find_all("div", class_="t-rec", attrs={"data-record-type": "396"})
+        price_recs = [r for r in recs if ("замена" in r.get_text(separator=" ", strip=True).lower() or "чистка" in r.get_text(separator=" ", strip=True).lower()) and "₽" in r.get_text(separator=" ", strip=True)]
 
-        target = set(_get_target_models())
-
-        for rec in recs:
-            rec_text = rec.get_text(separator=" ", strip=True)
-            model = None
-            for m in JABUKA_MACBOOK_MODEL_ORDER:
-                m_lower = m.lower().replace('"', '')
-                if m_lower in rec_text.lower():
-                    if m in target:
-                        model = m
-                        break
-            if not model:
-                headings = rec.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-                for h in headings:
-                    models = normalize_model_macbook_multi(h.get_text(strip=True))
-                    if models:
-                        for m in models:
-                            if m in target:
-                                model = m
-                                break
-                        if model:
-                            break
-            if not model:
+        for i, rec in enumerate(price_recs):
+            label = button_labels[i] if i < len(button_labels) else None
+            model = JABUKA_MACBOOK_LABEL_TO_MODEL.get(label) if label else None
+            if not model or model not in target:
                 continue
 
-            parts = rec.get_text(separator=" | ", strip=True).split(" | ")
-            if "₽" not in rec.get_text():
+            text = rec.get_text(separator=" ", strip=True)
+            if "₽" not in text:
                 continue
-            j = 0
-            while j + 1 < len(parts):
-                svc = parts[j].strip()
-                val = parts[j + 1].strip()
-                j += 2
-                if not re.match(r'[Зз]амена|Ремонт', svc):
+            segments = re.split(r'(?=Замена|Ремонт|Чистка)', text, flags=re.IGNORECASE)
+            for seg in segments:
+                seg = seg.strip()
+                if not re.match(r'[Зз]амена|[Рр]емонт|[Чч]истка', seg):
                     continue
-                if '₽' not in val and val != '-':
+                m = re.match(r'([Зз]амена|[Рр]емонт|[Чч]истка[^₽]*?)\s*(\d[\d\s]*)₽', seg)
+                if not m:
                     continue
-                if val in ('Звоните', '-'):
-                    continue
-                price = extract_price(val)
+                svc = m.group(1).strip()
+                price_text = m.group(2)
+                price = extract_price(price_text)
                 if not price or price <= 100:
                     continue
                 repair = normalize_repair(svc)

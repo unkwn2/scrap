@@ -662,18 +662,30 @@ def parse_google_sheets(url: str) -> list[dict]:
                     break
     return results
 
-JABUKA_MODEL_ORDER = [
-    "iPhone 17", "iPhone 17 Air", "iPhone 17 Pro", "iPhone 17 Pro Max",
-    "iPhone 16", "iPhone 16 Plus", "iPhone 16 Pro", "iPhone 16 Pro Max",
-    "iPhone 15", "iPhone 15 Plus", "iPhone 15 Pro", "iPhone 15 Pro Max",
-    "iPhone 14", "iPhone 14 Plus", "iPhone 14 Pro", "iPhone 14 Pro Max",
-    "iPhone 13", "iPhone 13 Pro", "iPhone 13 Pro Max", "iPhone 13 mini",
-    "iPhone 12", "iPhone 12 Pro", "iPhone 12 Pro Max", "iPhone 12 mini",
-    "iPhone 11", "iPhone 11 Pro", "iPhone 11 Pro Max",
-    "iPhone X", "iPhone XS", "iPhone XS Max", "iPhone XR",
-    "iPhone 8", "iPhone 8 Plus", "iPhone 7", "iPhone 7 Plus",
-    "iPhone 6", "iPhone 6s", "iPhone 6 Plus",
+JABUKA_BUTTON_LABELS = [
+    "17", "17 Air", "17 Pro", "17 Pro Max",
+    "16", "16 Plus", "16 Pro", "16 Pro Max",
+    "15", "15 Plus", "15 Pro", "15 Pro Max",
+    "14", "14 Plus", "14 Pro", "14 Pro Max",
+    "13", "13 Pro", "13 Pro Max", "13 Mini",
+    "12", "12 Pro", "12 Pro Max", "12 Mini",
+    "11", "11 Pro", "11 Pro Max",
+    "X", "Xs", "Xs Max", "Xr",
+    "7", "7 Plus", "8 / SE 2020 / 2022", "8 Plus",
+    "5-5S-SE", "6", "6s", "6 Plus / 6S Plus",
 ]
+
+JABUKA_LABEL_TO_MODEL = {}
+for _lbl in JABUKA_BUTTON_LABELS:
+    _m = normalize_model(_lbl)
+    if _m:
+        JABUKA_LABEL_TO_MODEL[_lbl] = _m
+JABUKA_LABEL_TO_MODEL["8 / SE 2020 / 2022"] = "iPhone 8"
+JABUKA_LABEL_TO_MODEL["5-5S-SE"] = "iPhone SE 2"
+JABUKA_LABEL_TO_MODEL["6 Plus / 6S Plus"] = "iPhone 6 Plus"
+JABUKA_LABEL_TO_MODEL["Xs"] = "iPhone XS"
+JABUKA_LABEL_TO_MODEL["Xs Max"] = "iPhone XS Max"
+JABUKA_LABEL_TO_MODEL["Xr"] = "iPhone XR"
 
 
 def parse_jabuka(url: str) -> list[dict]:
@@ -684,6 +696,7 @@ def parse_jabuka(url: str) -> list[dict]:
         return []
 
     results = []
+    target = set(_get_target_models())
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -694,35 +707,41 @@ def parse_jabuka(url: str) -> list[dict]:
             browser.close()
 
         soup = BeautifulSoup(content, "lxml")
+
+        selector_rec = soup.find("div", id="rec1643100411")
+        if not selector_rec:
+            selector_rec = soup.find("div", class_="t-rec")
+        buttons = selector_rec.find_all("div", attrs={"data-elem-type": "button"}) if selector_rec else []
+        button_labels = [b.get_text(strip=True) for b in buttons if b.get_text(strip=True)]
+
         recs = soup.find_all("div", class_="t-rec", attrs={"data-record-type": "396"})
+        price_recs = [r for r in recs if "замена" in r.get_text(separator=" ", strip=True).lower() and "₽" in r.get_text(separator=" ", strip=True)]
 
-        for rec in recs:
-            rec_text = rec.get_text(separator=" ", strip=True)
-            model = None
-            for m in JABUKA_MODEL_ORDER:
-                if m.lower() in rec_text.lower():
-                    if m in _get_target_models():
-                        model = m
-                        break
-            if not model:
-                headings = rec.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-                for h in headings:
-                    model = normalize_model(h.get_text(strip=True))
-                    if model and model in _get_target_models():
-                        break
-            if not model:
+        for i, rec in enumerate(price_recs):
+            label = button_labels[i] if i < len(button_labels) else None
+            model = JABUKA_LABEL_TO_MODEL.get(label) if label else None
+            if not model or model not in target:
                 continue
 
-            text = rec.get_text(separator=" | ", strip=True)
-            if "замена" not in text.lower() or "₽" not in text:
-                continue
-
-            pairs = re.findall(r'(Замена[^₽]*?)\s*(\d[\d\s]*)₽', text)
-            for repair_text, price_text in pairs:
+            text = rec.get_text(separator=" ", strip=True)
+            segments = re.split(r'(?=Замена)', text)
+            for seg in segments:
+                if not seg.strip().startswith("Замена"):
+                    continue
+                inner_match = re.match(r'(Замена[^₽]*?)\s*(\d[\d\s]*)₽', seg)
+                if not inner_match:
+                    continue
+                repair_text, price_text = inner_match.group(1), inner_match.group(2)
                 repair = normalize_repair(repair_text)
                 price = extract_price(price_text)
+                quality = ""
+                rt_upper = repair_text.upper()
+                if "REF" in rt_upper or "аналог" in repair_text.lower() or "COPY" in rt_upper:
+                    quality = "OEM"
+                elif "оригинал" in repair_text.lower() or ("ORIG" in rt_upper and "REF" not in rt_upper):
+                    quality = "AASP"
                 if repair and price and price > 100:
-                    results.append({"model": model, "repair": repair, "price": price})
+                    results.append({"model": model, "repair": repair, "price": price, "quality": quality})
     except Exception as e:
         print(f"  [ERROR] jabuka: {e}")
     return results
@@ -812,18 +831,31 @@ def parse_mosdisplay(_) -> list[dict]:
             if current_repair is None:
                 continue
 
+            col_prices = {}
             for col_idx, model in series_models.items():
                 cell_val = (rv[col_idx] or "").strip() if col_idx < len(rv) else ""
                 if not cell_val or cell_val.lower() in [
                     "-", "", "уточнять", "нужно уточнить", "недоступно", "уточнить",
                 ]:
+                    col_prices[col_idx] = None
                     continue
                 clean = cell_val.split("/")[0].split("вместе")[0].split("отдельно")[0]
                 clean = re.split(r"\s+(?=\d)", clean, maxsplit=1)[0].strip()
                 price = extract_price(clean)
                 if not price:
                     price = extract_price(cell_val)
-                if price and price > 100:
+                col_prices[col_idx] = price if price and price > 100 else None
+
+            first_price = None
+            for ci in sorted(col_prices):
+                if col_prices[ci] is not None:
+                    first_price = col_prices[ci]
+                    break
+            for col_idx, model in series_models.items():
+                price = col_prices.get(col_idx)
+                if price is None and first_price is not None:
+                    price = first_price
+                if price:
                     results.append({
                         "model": model,
                         "repair": current_repair,
@@ -1192,21 +1224,24 @@ def parse_applepie(base_url: str) -> list[dict]:
 
     results = []
     target = set(_get_target_models())
+    start = time.time()
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
             for model, page_url in APPLEPIE_MODEL_PAGES.items():
+                if time.time() - start > 240:
+                    print(f"  [INFO] applepie: 4min timeout reached, stopping")
+                    break
                 if model not in target:
                     continue
                 try:
-                    page.goto(page_url, timeout=20000)
-                    page.wait_for_timeout(4000)
-                    for _ in range(6):
+                    page.goto(page_url, timeout=15000)
+                    page.wait_for_timeout(2000)
+                    for _ in range(3):
                         page.evaluate("window.scrollBy(0, 500)")
-                        page.wait_for_timeout(200)
-                    page.wait_for_timeout(1000)
+                        page.wait_for_timeout(150)
                 except Exception:
                     continue
 
